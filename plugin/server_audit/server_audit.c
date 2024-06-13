@@ -21,6 +21,15 @@
 #define _my_thread_var loc_thread_var
 
 #include <my_config.h>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <future>
+#include <chrono>
+#include <pthread.h>
+#include <vector>
+#include <string>
+#include <sync_queue.h>
 #include <assert.h>
 
 #ifndef _WIN32
@@ -300,6 +309,13 @@ static char path_buffer[FN_REFLEN];
 static unsigned int mode, mode_readonly= 0;
 static ulong output_type;
 static ulong syslog_facility, syslog_priority;
+static pthread_t logger_thread;
+static pthread_mutex_t logger_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t logger_cond = PTHREAD_COND_INITIALIZER;
+static bool logger_thread_should_exit = false;
+std::string direct_log_message;
+bool direct_log_needed = false;
+pthread_cond_t direct_log_cond = PTHREAD_COND_INITIALIZER;
 
 static ulonglong events; /* mask for events to log */
 static unsigned long long file_rotate_size;
@@ -310,6 +326,8 @@ static volatile int internal_stop_logging= 0;
 static char incl_user_buffer[1024];
 static char excl_user_buffer[1024];
 static unsigned int query_log_limit= 0;
+static unsigned long long log_buffer_size= 0;
+SyncQueue<std::string> message_queue(1);
 
 static char servhost[HOSTNAME_LENGTH+1];
 static uint servhost_len;
@@ -371,6 +389,8 @@ static void update_syslog_ident(MYSQL_THD thd, struct st_mysql_sys_var *var,
                                 void *var_ptr, const void *save);
 static void rotate_log(MYSQL_THD thd, struct st_mysql_sys_var *var,
                        void *var_ptr, const void *save);
+static void update_log_buffer_size(MYSQL_THD thd, struct st_mysql_sys_var *var,
+                                    void *var_ptr, const void *save);
 
 static MYSQL_SYSVAR_STR(incl_users, incl_users, PLUGIN_VAR_RQCMDARG,
        "Comma separated list of users to monitor",
@@ -449,6 +469,9 @@ static MYSQL_SYSVAR_STR(syslog_info, syslog_info,
 static MYSQL_SYSVAR_UINT(query_log_limit, query_log_limit,
        PLUGIN_VAR_OPCMDARG, "Limit on the length of the query string in a record",
        NULL, NULL, 1024, 0, 0x7FFFFFFF, 1);
+static MYSQL_SYSVAR_ULONGLONG(log_buffer_size, log_buffer_size,
+       PLUGIN_VAR_RQCMDARG, "Size of the log buffer (1 or 20 to 1000)",
+       NULL, update_log_buffer_size, 1, 1, 100 * 1024 * 1024, 1);
 
 char locinfo_ini_value[sizeof(struct connection_info)+4];
 
@@ -531,6 +554,7 @@ static struct st_mysql_sys_var* vars[] = {
     MYSQL_SYSVAR(file_path),
     MYSQL_SYSVAR(file_rotate_size),
     MYSQL_SYSVAR(file_rotations),
+    MYSQL_SYSVAR(log_buffer_size),
     MYSQL_SYSVAR(file_rotate_now),
     MYSQL_SYSVAR(logging),
     MYSQL_SYSVAR(mode),
@@ -558,7 +582,7 @@ static struct st_mysql_show_var audit_status[]=
   {"server_audit_current_log", current_log_buf, SHOW_CHAR},
   {"server_audit_writes_failed", (char *)&log_write_failures, SHOW_LONG},
   {"server_audit_last_error", last_error_buf, SHOW_CHAR},
-  {0,0,0}
+  {0, 0, SHOW_UNDEF},
 };
 
 #ifdef HAVE_PSI_INTERFACE
@@ -724,9 +748,9 @@ static int coll_insert(struct user_coll *c, char *n, size_t len)
   {
     c->n_alloced+= 128;
     if (c->users == NULL)
-      c->users= malloc(c->n_alloced * sizeof(c->users[0]));
+      c->users = (user_name*)malloc(c->n_alloced * sizeof(user_name));
     else
-      c->users= realloc(c->users, c->n_alloced * sizeof(c->users[0]));
+      c->users = (user_name*)realloc(c->users, c->n_alloced * sizeof(user_name));
 
     if (c->users == NULL)
       return 1;
@@ -1337,6 +1361,80 @@ static void change_connection(struct connection_info *cn,
             event->ip, event->ip_length);
 }
 
+
+std::future<void> async_write_log(const std::string& message)
+{
+    return std::async(std::launch::async, [&message]() {
+        if (logfile->buffer_size == 0)
+        {
+            pthread_mutex_lock(&logger_mutex);
+            direct_log_message = message;
+            direct_log_needed = true;
+            pthread_cond_signal(&logger_cond);
+            pthread_mutex_unlock(&logger_mutex);
+        }
+        else
+        {
+            pthread_mutex_lock(&logger_mutex);
+            message_queue.push(message);
+            if (message_queue.is_full()) {
+                pthread_cond_signal(&logger_cond);
+            }
+            pthread_mutex_unlock(&logger_mutex);
+        }
+    });
+}
+
+void* logger_thread_func(void* arg)
+{
+    while (true)
+    {
+        pthread_mutex_lock(&logger_mutex);
+        while (message_queue.empty() && !logger_thread_should_exit && !direct_log_needed)
+        {
+            pthread_cond_wait(&logger_cond, &logger_mutex);
+        }
+        if (logger_thread_should_exit && message_queue.empty() && !direct_log_needed)
+        {
+            pthread_mutex_unlock(&logger_mutex);
+            break;
+        }
+        if (direct_log_needed)
+        {
+            std::string message = direct_log_message;
+            direct_log_needed = false;
+            pthread_mutex_unlock(&logger_mutex);
+            if (logfile)
+            {
+                if (logger_time_to_rotate(logfile)) {}
+                if (!(is_active = (logger_write_r(logfile, logger_time_to_rotate(logfile), message.c_str(), message.length()) == (int)message.length())))
+                {
+                    ++log_write_failures;
+                }
+            }
+            continue;
+        }
+        std::string concatenated_messages;
+        while (!message_queue.empty())
+        {
+            concatenated_messages += message_queue.pop();
+        }
+
+        pthread_mutex_unlock(&logger_mutex);
+
+        if (logfile)
+        {
+            if (logger_time_to_rotate(logfile)) {}
+            if (!(is_active = (logger_write_r(logfile, logger_time_to_rotate(logfile), concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length())))
+            {
+                ++log_write_failures;
+            }
+        }
+    }
+    return nullptr;
+}
+
+
 /*
   Write to the log
 
@@ -1344,45 +1442,36 @@ static void change_connection(struct connection_info *cn,
                     If not set, the caller has a already taken a write lock
 */
 
+
 static int write_log(const char *message, size_t len, int take_lock)
 {
-  int result= 0;
-  if (take_lock)
-  {
-    /* Start by taking a read lock */
-    mysql_prlock_rdlock(&lock_operations);
-  }
-
+  int result = 0;
   if (output_type == OUTPUT_FILE)
   {
     if (logfile)
     {
-      my_bool allow_rotate= !take_lock; /* Allow rotate if caller write lock */
-      if (take_lock && logger_time_to_rotate(logfile))
-      {
-        /* We have to rotate the log, change above read lock to write lock */
-        mysql_prlock_unlock(&lock_operations);
-        mysql_prlock_wrlock(&lock_operations);
-        allow_rotate= 1;
-      }
-      if (!(is_active= (logger_write_r(logfile, allow_rotate, message, len) ==
-                        (int) len)))
-      {
-        ++log_write_failures;
-        result= 1;
-      }
+      std::string log_message(message, len);
+      async_write_log(log_message);
     }
   }
   else if (output_type == OUTPUT_SYSLOG)
   {
+    if (take_lock)
+    {
+      mysql_prlock_rdlock(&lock_operations);
+    }
     syslog(syslog_facility_codes[syslog_facility] |
-           syslog_priority_codes[syslog_priority],
-           "%s %.*s", syslog_info, (int) len, message);
+      syslog_priority_codes[syslog_priority],
+      "%s %.*s", syslog_info, (int) len, message);
+    if (take_lock)
+    {
+      mysql_prlock_unlock(&lock_operations);
+    }
   }
-  if (take_lock)
-    mysql_prlock_unlock(&lock_operations);
   return result;
 }
+
+
 
 
 static size_t log_header(char *message, size_t message_len,
@@ -1848,7 +1937,7 @@ do_log_query:
   if (query_len > (message_size - csize)/2)
   {
     size_t big_buffer_alloced= (query_len * 2 + csize + 4095) & ~4095L;
-    if(!(big_buffer= malloc(big_buffer_alloced)))
+    if(!(big_buffer = (char*)malloc(big_buffer_alloced)))
       return 0;
 
     memcpy(big_buffer, message, csize);
@@ -2135,7 +2224,7 @@ struct connection_info cn_error_buffer;
 
 
 #define FILTER(MASK) (events == 0 || (events & MASK))
-void auditing(MYSQL_THD thd, unsigned int event_class, const void *ev)
+extern "C" void auditing(MYSQL_THD thd, unsigned int event_class, const void *ev)
 {
   struct connection_info *cn= 0;
   int after_action= 0;
@@ -2278,6 +2367,7 @@ exit_func:
 }
 
 
+
 struct mysql_event_general_v8
 {
   unsigned int event_class;
@@ -2380,7 +2470,7 @@ static void auditing_v13(MYSQL_THD thd, unsigned int *ev_v0)
 }
 
 
-int get_db_mysql57(MYSQL_THD thd, char **name, size_t *len)
+extern "C" int get_db_mysql57(MYSQL_THD thd, char **name, size_t *len)
 {
 #ifdef __linux__
   int db_off;
@@ -2511,26 +2601,30 @@ static int server_audit_init(void *p __attribute__((unused)))
 {
   if (!serv_ver)
   {
-    serv_ver= find_sym("server_version");
+    serv_ver= (const char*)find_sym("server_version");
+
   }
 
   if (!mysql_57_started)
   {
     const void *my_hash_init_ptr= find_sym("_my_hash_init");
+
     if (!my_hash_init_ptr)
     {
       maria_above_5= 1;
       my_hash_init_ptr= find_sym("my_hash_init2");
+
     }
     if (!my_hash_init_ptr)
       return 1;
 
-    thd_priv_host_ptr= dlsym(RTLD_DEFAULT, "thd_priv_host");
+    thd_priv_host_ptr= (const char* (*)(THD*, size_t*)) dlsym(RTLD_DEFAULT, "thd_priv_host");
+
   }
 
-  if(!(int_mysql_data_home= find_sym("mysql_data_home")))
+  if(!(int_mysql_data_home= (char**)find_sym("mysql_data_home")))
   {
-    if(!(int_mysql_data_home= find_sym("?mysql_data_home@@3PADA")))
+    if(!(int_mysql_data_home= (char**)find_sym("?mysql_data_home@@3PADA")))
       int_mysql_data_home= &default_home;
   }
 
@@ -2611,6 +2705,12 @@ static int server_audit_init(void *p __attribute__((unused)))
   ci_disconnect_buffer.query= empty_str;
   ci_disconnect_buffer.query_length= 0;
 
+  if (pthread_create(&logger_thread, NULL, logger_thread_func, NULL) != 0) {
+    error_header();
+    fprintf(stderr, "Failed to create logger thread.\n");
+    return 1;
+  }
+
   if (logging)
     start_logging();
 
@@ -2633,7 +2733,7 @@ static int server_audit_deinit(void *p __attribute__((unused)))
   if (!init_done)
     return 0;
 
-  init_done= 0;
+  init_done = 0;
   coll_free(&incl_user_coll);
   coll_free(&excl_user_coll);
 
@@ -2641,6 +2741,11 @@ static int server_audit_deinit(void *p __attribute__((unused)))
     logger_close(logfile);
   else if (output_type == OUTPUT_SYSLOG)
     closelog();
+  pthread_mutex_lock(&logger_mutex);
+  logger_thread_should_exit = true;
+  pthread_cond_signal(&logger_cond);
+  pthread_mutex_unlock(&logger_mutex);
+  pthread_join(logger_thread, NULL);
 
   mysql_prlock_destroy(&lock_operations);
   flogger_mutex_destroy(&lock_atomic);
@@ -2750,17 +2855,22 @@ static void update_file_path(MYSQL_THD thd,
   ADD_ATOMIC(internal_stop_logging, 1);
   error_header();
   fprintf(stderr, "Log file name was changed to '%s'.\n", new_name);
+   if (logfile) {
+    } else {
+    }
 
   if (!maria_55_started || !debug_server_started)
     mysql_prlock_wrlock(&lock_operations);
 
   if (logging)
     log_current_query(thd);
+  if (logfile ) {
+    } else {
+    }
 
   if (logging && output_type == OUTPUT_FILE)
   {
     char *sav_path= file_path;
-
     file_path= new_name;
     stop_logging();
     if (start_logging())
@@ -2802,6 +2912,33 @@ static void update_file_rotations(MYSQL_THD thd  __attribute__((unused)),
 
   mysql_prlock_wrlock(&lock_operations);
   logfile->rotations= rotations;
+  mysql_prlock_unlock(&lock_operations);
+}
+
+static void update_log_buffer_size(MYSQL_THD thd  __attribute__((unused)),
+              struct st_mysql_sys_var *var  __attribute__((unused)),
+              void *var_ptr  __attribute__((unused)), const void *save)
+{
+  log_buffer_size = *(unsigned long long *) save;
+  error_header();
+  fprintf(stderr, "Log buffer size was changed to '%lld'.\n", log_buffer_size);
+
+  if (!logging || output_type != OUTPUT_FILE) 
+  {
+    fprintf(stderr, "Logging is off or output type is not FILE, exiting function.\n");
+    return;
+  }
+
+  pthread_mutex_lock(&logger_mutex);
+  pthread_cond_signal(&logger_cond);
+  pthread_mutex_unlock(&logger_mutex);
+
+  mysql_prlock_wrlock(&lock_operations);
+
+  message_queue.resize(static_cast<size_t>(log_buffer_size));
+
+  logfile->buffer_size = log_buffer_size;
+
   mysql_prlock_unlock(&lock_operations);
 }
 
@@ -3090,12 +3227,12 @@ void __attribute__ ((constructor)) audit_plugin_so_init(void)
       if (sc <= 10)
       {
         mysql_descriptor.interface_version= 0x0200;
-        mysql_descriptor.event_notify= (void *) auditing_v8;
+        mysql_descriptor.event_notify= (void (*)(THD*, unsigned int, const void*)) auditing_v8;
       }
       else if (sc < 14)
       {
         mysql_descriptor.interface_version= 0x0200;
-        mysql_descriptor.event_notify= (void *) auditing_v13;
+        mysql_descriptor.event_notify= (void (*)(THD*, unsigned int, const void*)) auditing_v13;
       }
     }
     else if (serv_ver[0] == '5' && serv_ver[2] == '6')

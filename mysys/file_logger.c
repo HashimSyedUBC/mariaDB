@@ -41,6 +41,7 @@ typedef struct logger_handle_st {
   char path[FN_REFLEN];
   unsigned long long size_limit;
   unsigned int rotations;
+  unsigned long long buffer_size;
   size_t path_len;
   mysql_mutex_t lock;
 } LSFS;
@@ -68,6 +69,7 @@ LOGGER_HANDLE *logger_open(const char *path,
 
   new_log.rotations= rotations;
   new_log.size_limit= size_limit;
+  new_log.buffer_size= 0;
   new_log.path_len= strlen(fn_format(new_log.path, path,
         mysql_data_home, "", MY_UNPACK_FILENAME));
 
