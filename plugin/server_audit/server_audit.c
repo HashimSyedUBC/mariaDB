@@ -1111,8 +1111,12 @@ static int start_logging()
         alt_fname= alt_path_buffer;
       }
     }
+    fprintf(stderr, "logger open called ---------------\n");
+
 
     logfile= logger_open(alt_fname, file_rotate_size, rotations);
+    fprintf(stderr, "logger open success ///////");
+
 
     if (logfile == NULL)
     {
@@ -1364,32 +1368,38 @@ static void change_connection(struct connection_info *cn,
 
 std::future<void> async_write_log(const std::string& message)
 {
+
     return std::async(std::launch::async, [&message]() {
-        if (logfile->buffer_size == 0)
+      fprintf(stderr, "\n logfile->buffer: %d \n", logfile->buffer_size);
+      pthread_mutex_lock(&logger_mutex);
+
+        if (logfile->buffer_size <= 1)
         {
-            pthread_mutex_lock(&logger_mutex);
             direct_log_message = message;
-            direct_log_needed = true;
+            direct_log_needed = true; // might be over writen
             pthread_cond_signal(&logger_cond);
-            pthread_mutex_unlock(&logger_mutex);
         }
         else
         {
-            pthread_mutex_lock(&logger_mutex);
             message_queue.push(message);
             if (message_queue.is_full()) {
                 pthread_cond_signal(&logger_cond);
             }
-            pthread_mutex_unlock(&logger_mutex);
         }
+      pthread_mutex_unlock(&logger_mutex);
+      
     });
 }
+
+
+
 
 void* logger_thread_func(void* arg)
 {
     while (true)
     {
-        pthread_mutex_lock(&logger_mutex);
+      pthread_mutex_lock(&logger_mutex);
+
         while (message_queue.empty() && !logger_thread_should_exit && !direct_log_needed)
         {
             pthread_cond_wait(&logger_cond, &logger_mutex);
@@ -1403,7 +1413,6 @@ void* logger_thread_func(void* arg)
         {
             std::string message = direct_log_message;
             direct_log_needed = false;
-            pthread_mutex_unlock(&logger_mutex);
             if (logfile)
             {
                 if (logger_time_to_rotate(logfile)) {}
@@ -1412,6 +1421,8 @@ void* logger_thread_func(void* arg)
                     ++log_write_failures;
                 }
             }
+            fprintf(stderr, "\n just unlocked mutx \n");
+            pthread_mutex_unlock(&logger_mutex);
             continue;
         }
         std::string concatenated_messages;
@@ -1470,6 +1481,46 @@ static int write_log(const char *message, size_t len, int take_lock)
   }
   return result;
 }
+
+// static int write_log(const char *message, size_t len, int take_lock)
+// {
+//   int result= 0;
+//   if (take_lock)
+//   {
+//     /* Start by taking a read lock */
+//     mysql_prlock_rdlock(&lock_operations);
+//   }
+
+//   if (output_type == OUTPUT_FILE)
+//   {
+//     if (logfile)
+//     {
+//       my_bool allow_rotate= !take_lock; /* Allow rotate if caller write lock */
+//       if (take_lock && logger_time_to_rotate(logfile))
+//       {
+//         /* We have to rotate the log, change above read lock to write lock */
+//         mysql_prlock_unlock(&lock_operations);
+//         mysql_prlock_wrlock(&lock_operations);
+//         allow_rotate= 1;
+//       }
+//       if (!(is_active= (logger_write_r(logfile, allow_rotate, message, len) ==
+//                         (int) len)))
+//       {
+//         ++log_write_failures;
+//         result= 1;
+//       }
+//     }
+//   }
+//   else if (output_type == OUTPUT_SYSLOG)
+//   {
+//     syslog(syslog_facility_codes[syslog_facility] |
+//            syslog_priority_codes[syslog_priority],
+//            "%s %.*s", syslog_info, (int) len, message);
+//   }
+//   if (take_lock)
+//     mysql_prlock_unlock(&lock_operations);
+//   return result;
+// }
 
 
 
@@ -2730,6 +2781,14 @@ static int server_audit_init_mysql(void *p)
 
 static int server_audit_deinit(void *p __attribute__((unused)))
 {
+
+
+  pthread_mutex_lock(&logger_mutex);
+  logger_thread_should_exit = true;
+  pthread_cond_signal(&logger_cond);
+  pthread_mutex_unlock(&logger_mutex);
+  pthread_join(logger_thread, NULL);
+
   if (!init_done)
     return 0;
 
@@ -2737,15 +2796,12 @@ static int server_audit_deinit(void *p __attribute__((unused)))
   coll_free(&incl_user_coll);
   coll_free(&excl_user_coll);
 
-  if (output_type == OUTPUT_FILE && logfile)
+  if (output_type == OUTPUT_FILE && logfile) {
     logger_close(logfile);
+    logfile = NULL;
+  }
   else if (output_type == OUTPUT_SYSLOG)
     closelog();
-  pthread_mutex_lock(&logger_mutex);
-  logger_thread_should_exit = true;
-  pthread_cond_signal(&logger_cond);
-  pthread_mutex_unlock(&logger_mutex);
-  pthread_join(logger_thread, NULL);
 
   mysql_prlock_destroy(&lock_operations);
   flogger_mutex_destroy(&lock_atomic);
