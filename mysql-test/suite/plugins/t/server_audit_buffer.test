@@ -66,6 +66,7 @@ drop table renamed_t1, t2;
 show variables like 'server_audit%';
 set global server_audit_mode=1;
 set global server_audit_events='';
+set global server_audit_log_buffer_size=50;
 create database sa_db;
 let SEARCH_COUNT= 47;
 
@@ -108,6 +109,7 @@ drop procedure pr1;
 drop function fn1;
 
 set global server_audit_events='query_ddl,query_dml';
+set global server_audit_log_buffer_size=1;
 create table t1(id int);
 insert into t1 values (1), (2);
 select * from t1;
