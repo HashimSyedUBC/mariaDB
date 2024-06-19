@@ -309,13 +309,11 @@ static char path_buffer[FN_REFLEN];
 static unsigned int mode, mode_readonly= 0;
 static ulong output_type;
 static ulong syslog_facility, syslog_priority;
-static pthread_t logger_thread;
 static pthread_mutex_t logger_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t logger_cond = PTHREAD_COND_INITIALIZER;
-static bool logger_thread_should_exit = false;
-std::string direct_log_message;
-bool direct_log_needed = false;
-pthread_cond_t direct_log_cond = PTHREAD_COND_INITIALIZER;
+std::atomic<int> active_log_jobs(0);
+std::mutex cv_m;
+std::condition_variable cv;
+
 
 static ulonglong events; /* mask for events to log */
 static unsigned long long file_rotate_size;
@@ -1111,12 +1109,7 @@ static int start_logging()
         alt_fname= alt_path_buffer;
       }
     }
-    fprintf(stderr, "logger open called ---------------\n");
-
-
     logfile= logger_open(alt_fname, file_rotate_size, rotations);
-    fprintf(stderr, "logger open success ///////");
-
 
     if (logfile == NULL)
     {
@@ -1148,6 +1141,48 @@ static int start_logging()
   return 0;
 }
 
+void flush_buffer(const std::vector<std::string>& all_messages) {
+    std::string concatenated_messages = "";
+    if (logfile == NULL) return;
+
+    // Use the initial size when starting a new batch of pushes
+    my_off_t filesize = logger_space_left(logfile); // High I/O called once every batch
+    my_off_t initial_filesize = file_rotate_size;
+
+    for (int i = 0; i < all_messages.size(); i++) {
+        if (concatenated_messages.size() > filesize) {
+            if (!(is_active = (logger_write_r(logfile, 1, concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length()))) {
+                ++log_write_failures;
+            }
+            concatenated_messages = "";
+            filesize = initial_filesize; // Start with initial file size each time you reach 0
+        }
+        std::string msg = all_messages[i];
+        concatenated_messages = concatenated_messages + msg;
+        filesize -= msg.size(); // Decrment the filesize to keep track of if rotation is needed
+    }
+    if (concatenated_messages != "") {
+      if (!(is_active = (logger_write_r(logfile, 1, concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length()))) {
+        ++log_write_failures;
+      }
+    }
+}
+
+void resize_flush(size_t new_size) {
+  // This is called when resizing the queue
+  active_log_jobs++;
+  pthread_mutex_lock(&logger_mutex);
+
+  std::vector<std::string> all_messages = message_queue.flush();
+
+  flush_buffer(all_messages);
+  message_queue.resize(new_size);
+  pthread_mutex_unlock(&logger_mutex);
+  if (--active_log_jobs == 0) {
+            std::lock_guard<std::mutex> lock(cv_m);
+            cv.notify_all();
+  }
+}
 
 static int stop_logging()
 {
@@ -1365,85 +1400,37 @@ static void change_connection(struct connection_info *cn,
             event->ip, event->ip_length);
 }
 
-
 std::future<void> async_write_log(const std::string& message)
 {
-
     return std::async(std::launch::async, [&message]() {
-      fprintf(stderr, "\n logfile->buffer: %d \n", logfile->buffer_size);
+      active_log_jobs++;
+      int active_jobs = active_log_jobs.load();
       pthread_mutex_lock(&logger_mutex);
-
-        if (logfile->buffer_size <= 1)
+      if (log_buffer_size <= 1)
+      {
+        if (!(is_active= (logger_write_r(logfile, logger_time_to_rotate(logfile), message.c_str(), message.length()) == (int)message.length())))
         {
-            direct_log_message = message;
-            direct_log_needed = true; // might be over writen
-            pthread_cond_signal(&logger_cond);
+          ++log_write_failures;
         }
-        else
-        {
-            message_queue.push(message);
-            if (message_queue.is_full()) {
-                pthread_cond_signal(&logger_cond);
-            }
+      }
+      else
+      {
+        if (message_queue.is_full()) {
+          std::vector<std::string> all_messages = message_queue.flush();
+          flush_buffer(all_messages);
         }
+        message_queue.push(message);
+      }
       pthread_mutex_unlock(&logger_mutex);
-      
+      if (--active_log_jobs == 0) {
+            std::lock_guard<std::mutex> lock(cv_m);
+            cv.notify_all();
+      }
     });
 }
 
 
 
-
-void* logger_thread_func(void* arg)
-{
-    while (true)
-    {
-      pthread_mutex_lock(&logger_mutex);
-
-        while (message_queue.empty() && !logger_thread_should_exit && !direct_log_needed)
-        {
-            pthread_cond_wait(&logger_cond, &logger_mutex);
-        }
-        if (logger_thread_should_exit && message_queue.empty() && !direct_log_needed)
-        {
-            pthread_mutex_unlock(&logger_mutex);
-            break;
-        }
-        if (direct_log_needed)
-        {
-            std::string message = direct_log_message;
-            direct_log_needed = false;
-            if (logfile)
-            {
-                if (logger_time_to_rotate(logfile)) {}
-                if (!(is_active = (logger_write_r(logfile, logger_time_to_rotate(logfile), message.c_str(), message.length()) == (int)message.length())))
-                {
-                    ++log_write_failures;
-                }
-            }
-            fprintf(stderr, "\n just unlocked mutx \n");
-            pthread_mutex_unlock(&logger_mutex);
-            continue;
-        }
-        std::string concatenated_messages;
-        while (!message_queue.empty())
-        {
-            concatenated_messages += message_queue.pop();
-        }
-
-        pthread_mutex_unlock(&logger_mutex);
-
-        if (logfile)
-        {
-            if (logger_time_to_rotate(logfile)) {}
-            if (!(is_active = (logger_write_r(logfile, logger_time_to_rotate(logfile), concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length())))
-            {
-                ++log_write_failures;
-            }
-        }
-    }
-    return nullptr;
-}
 
 
 /*
@@ -1467,6 +1454,7 @@ static int write_log(const char *message, size_t len, int take_lock)
   }
   else if (output_type == OUTPUT_SYSLOG)
   {
+
     if (take_lock)
     {
       mysql_prlock_rdlock(&lock_operations);
@@ -1481,47 +1469,6 @@ static int write_log(const char *message, size_t len, int take_lock)
   }
   return result;
 }
-
-// static int write_log(const char *message, size_t len, int take_lock)
-// {
-//   int result= 0;
-//   if (take_lock)
-//   {
-//     /* Start by taking a read lock */
-//     mysql_prlock_rdlock(&lock_operations);
-//   }
-
-//   if (output_type == OUTPUT_FILE)
-//   {
-//     if (logfile)
-//     {
-//       my_bool allow_rotate= !take_lock; /* Allow rotate if caller write lock */
-//       if (take_lock && logger_time_to_rotate(logfile))
-//       {
-//         /* We have to rotate the log, change above read lock to write lock */
-//         mysql_prlock_unlock(&lock_operations);
-//         mysql_prlock_wrlock(&lock_operations);
-//         allow_rotate= 1;
-//       }
-//       if (!(is_active= (logger_write_r(logfile, allow_rotate, message, len) ==
-//                         (int) len)))
-//       {
-//         ++log_write_failures;
-//         result= 1;
-//       }
-//     }
-//   }
-//   else if (output_type == OUTPUT_SYSLOG)
-//   {
-//     syslog(syslog_facility_codes[syslog_facility] |
-//            syslog_priority_codes[syslog_priority],
-//            "%s %.*s", syslog_info, (int) len, message);
-//   }
-//   if (take_lock)
-//     mysql_prlock_unlock(&lock_operations);
-//   return result;
-// }
-
 
 
 
@@ -2756,12 +2703,6 @@ static int server_audit_init(void *p __attribute__((unused)))
   ci_disconnect_buffer.query= empty_str;
   ci_disconnect_buffer.query_length= 0;
 
-  if (pthread_create(&logger_thread, NULL, logger_thread_func, NULL) != 0) {
-    error_header();
-    fprintf(stderr, "Failed to create logger thread.\n");
-    return 1;
-  }
-
   if (logging)
     start_logging();
 
@@ -2782,12 +2723,7 @@ static int server_audit_init_mysql(void *p)
 static int server_audit_deinit(void *p __attribute__((unused)))
 {
 
-
-  pthread_mutex_lock(&logger_mutex);
-  logger_thread_should_exit = true;
-  pthread_cond_signal(&logger_cond);
-  pthread_mutex_unlock(&logger_mutex);
-  pthread_join(logger_thread, NULL);
+  resize_flush(0);
 
   if (!init_done)
     return 0;
@@ -2802,6 +2738,16 @@ static int server_audit_deinit(void *p __attribute__((unused)))
   }
   else if (output_type == OUTPUT_SYSLOG)
     closelog();
+  {
+    std::unique_lock<std::mutex> lock(cv_m);
+    cv.wait(lock, [] { return active_log_jobs.load() == 0; });
+  }
+
+  // // Destroy the logger mutex
+  int ret = pthread_mutex_destroy(&logger_mutex);
+  if (ret != 0) {
+    fprintf(stderr, "Failed to destroy logger mutex \n");
+  }
 
   mysql_prlock_destroy(&lock_operations);
   flogger_mutex_destroy(&lock_atomic);
@@ -2971,27 +2917,21 @@ static void update_file_rotations(MYSQL_THD thd  __attribute__((unused)),
   mysql_prlock_unlock(&lock_operations);
 }
 
+
 static void update_log_buffer_size(MYSQL_THD thd  __attribute__((unused)),
               struct st_mysql_sys_var *var  __attribute__((unused)),
               void *var_ptr  __attribute__((unused)), const void *save)
 {
   log_buffer_size = *(unsigned long long *) save;
+  resize_flush(static_cast<size_t>(log_buffer_size));
   error_header();
   fprintf(stderr, "Log buffer size was changed to '%lld'.\n", log_buffer_size);
-
   if (!logging || output_type != OUTPUT_FILE) 
   {
     fprintf(stderr, "Logging is off or output type is not FILE, exiting function.\n");
     return;
   }
-
-  pthread_mutex_lock(&logger_mutex);
-  pthread_cond_signal(&logger_cond);
-  pthread_mutex_unlock(&logger_mutex);
-
   mysql_prlock_wrlock(&lock_operations);
-
-  message_queue.resize(static_cast<size_t>(log_buffer_size));
 
   logfile->buffer_size = log_buffer_size;
 

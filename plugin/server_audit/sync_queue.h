@@ -12,25 +12,25 @@ public:
   void push(T item) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (queue_.size() == max_size_) {
-      printf("Queue is full, cannot push item.\n"); // Debugging statement
+      fprintf(stderr, "Queue is full, cannot push item. THIS IS SHOULD HAVE HAPPENED \n"); // Debugging statement
     } else {
       queue_.push(item);
-      printf("Pushed item to queue.\n"); // Debugging statement
+      fprintf(stderr, "Pushed item to queue.\n"); // Debugging statement
       cond_.notify_one();
-      printf("Notified condition variable.\n"); // Debugging statement
+      fprintf(stderr, "Notified condition variable.\n"); // Debugging statement
     }
   }
 
   T pop() {
     std::unique_lock<std::mutex> lock(mutex_);
-    printf("Waiting for condition variable...\n"); // Debugging statement
+    fprintf(stderr, "Waiting for condition variable...\n"); // Debugging statement
     cond_.wait(lock,
                [this]() { return !queue_.empty(); });
-    printf("Condition variable signaled.\n"); // Debugging statement
+    fprintf(stderr, "Condition variable signaled.\n"); // Debugging statement
 
     T item = queue_.front();
     queue_.pop();
-    printf("Popped item from queue.\n"); // Debugging statement
+    fprintf(stderr, "Popped item from queue.\n"); // Debugging statement
     return item;
   }
 
@@ -41,19 +41,30 @@ public:
 
   void resize(size_t new_max_size) {
     std::lock_guard<std::mutex> lock(mutex_);
-    printf("Resizing queue to size %zu\n", new_max_size); // Debugging statement
+    fprintf(stderr, "Resizing queue to size %zu\n", new_max_size); // Debugging statement
     max_size_ = new_max_size;
   }
 
   bool is_full() {
     std::lock_guard<std::mutex> lock(mutex_);
     bool is_full = queue_.size() == max_size_;
-    printf("Queue is %s\n", is_full ? "full" : "not full"); // Debugging statement
+    fprintf(stderr, "Queue is %s\n", is_full ? "full" : "not full"); // Debugging statement
     return is_full;
   }
 
+  std::vector<T> flush() {
+      std::lock_guard<std::mutex> lock(mutex_);
+      std::vector<T> all_messages;
+      all_messages.reserve(queue_.size());
+      while (!queue_.empty()) {
+          all_messages.push_back(queue_.front());
+          queue_.pop();
+      }
+      return all_messages;
+  }
+
   SyncQueue(size_t max_size): max_size_(max_size) {
-    printf("Initialized SyncQueue with max size %zu\n", max_size); // Debugging statement
+    fprintf(stderr, "Initialized SyncQueue with max size %zu\n", max_size); // Debugging statement
   }
 
 private:

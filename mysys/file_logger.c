@@ -167,6 +167,15 @@ my_bool logger_time_to_rotate(LOGGER_HANDLE *log)
   return 0;
 }
 
+my_off_t logger_space_left(LOGGER_HANDLE *log) {
+    my_off_t filesize;
+    if (log->rotations > 0 &&
+        (filesize = my_tell(log->file, MYF(0))) != (my_off_t) -1) {
+        return log->size_limit - filesize;
+    }
+    return (my_off_t) -1; // Indicate an error or invalid state
+}
+
 
 int logger_vprintf(LOGGER_HANDLE *log, const char* fmt, va_list ap)
 {
