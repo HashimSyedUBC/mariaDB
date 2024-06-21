@@ -2925,12 +2925,12 @@ static void update_log_buffer_size(MYSQL_THD thd  __attribute__((unused)),
   log_buffer_size = *(unsigned long long *) save;
   resize_flush(static_cast<size_t>(log_buffer_size));
   error_header();
-  fprintf(stderr, "Log buffer size was changed to '%lld'.\n", log_buffer_size);
+  fprintf(stderr, "Log buffer size was changed to '%lld'.\n", 
+  log_buffer_size);
+
   if (!logging || output_type != OUTPUT_FILE) 
-  {
-    fprintf(stderr, "Logging is off or output type is not FILE, exiting function.\n");
     return;
-  }
+
   mysql_prlock_wrlock(&lock_operations);
 
   logfile->buffer_size = log_buffer_size;
