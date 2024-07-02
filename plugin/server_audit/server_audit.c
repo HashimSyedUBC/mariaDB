@@ -29,7 +29,6 @@
 #include <pthread.h>
 #include <vector>
 #include <string>
-#include <sync_queue.h>
 #include <assert.h>
 
 #ifndef _WIN32
@@ -311,11 +310,6 @@ static ulong output_type;
 static ulong syslog_facility, syslog_priority;
 std::queue<std::string> log_queue;
 size_t max_size_log_queue= 0;
-std::mutex log_mutex;
-std::mutex queue_mutex;
-std::condition_variable cv;
-std::atomic<bool> is_running(true);
-std::thread logger_thread;
 
 
 static ulonglong events; /* mask for events to log */
@@ -328,7 +322,7 @@ static char incl_user_buffer[1024];
 static char excl_user_buffer[1024];
 static unsigned int query_log_limit= 0;
 static unsigned long long log_buffer_size= 0;
-SyncQueue<std::string> message_queue(1);
+
 
 static char servhost[HOSTNAME_LENGTH+1];
 static uint servhost_len;
@@ -715,6 +709,9 @@ static void coll_free(struct user_coll *c)
     coll_init(c);
   }
 }
+
+
+
 
 
 static int cmp_users(const void *ia, const void *ib)
@@ -1144,7 +1141,8 @@ static int start_logging()
   return 0;
 }
 
-void flush_buffer(const std::vector<std::string>& all_messages) {
+
+void flush_vector(const std::vector<std::string>& all_messages) {
     std::string concatenated_messages = "";
     if (logfile == NULL) return;
     // Use the initial size when starting a new batch of pushes
@@ -1153,6 +1151,7 @@ void flush_buffer(const std::vector<std::string>& all_messages) {
 
     for (int i = 0; i < all_messages.size(); i++) {
         if (concatenated_messages.size() > filesize) {
+            fprintf(stderr, "\n\n\n writing this conc insde for loop no lockk%s", concatenated_messages.c_str());
             if (!(is_active = (logger_write_r(logfile, 1, concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length()))) {
                 ++log_write_failures;
             }
@@ -1164,27 +1163,38 @@ void flush_buffer(const std::vector<std::string>& all_messages) {
         filesize -= msg.size(); // Decrement the filesize to keep track of if rotation is needed
     }
     if (concatenated_messages != "") {
+      fprintf(stderr, "\n\n\n writing this conc OUTSIDE this isfor loop no lockk%s", concatenated_messages.c_str());
+
       if (!(is_active = (logger_write_r(logfile, 1, concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length()))) {
         ++log_write_failures;
       }
     }
 }
 
+void flush_buffer() {
+    std::vector<std::string> msgs;
+    if (log_queue.size() < max_size_log_queue) return;
+    while (!log_queue.empty()) {
+        msgs.push_back(log_queue.front());
+        log_queue.pop();
+    }
+    flush_vector(msgs);
+}
+
 static void resize_flush(size_t new_size) 
 {
-  std::unique_lock<std::mutex> lock(queue_mutex);
-  cv.notify_one();  
-  cv.wait(lock, [] { return log_queue.empty(); });  
-  max_size_log_queue = new_size;  
+  max_size_log_queue= new_size;
+  flush_buffer();
 }
+
+
 
 static int stop_logging()
 {
   last_error_buf[0]= 0;
   if (output_type == OUTPUT_FILE && logfile)
   {
-    cv.notify_one();
-    resize_flush(log_buffer_size);
+    flush_buffer();
     logger_close(logfile);
     logfile= NULL;
   }
@@ -1396,49 +1406,7 @@ static void change_connection(struct connection_info *cn,
             event->ip, event->ip_length);
 }
 
-void logger_thread_func() {
-    while (is_running || !log_queue.empty()) {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        cv.wait(lock, [] {
-            return !log_queue.empty() || !is_running.load();
-        });
-        std::vector<std::string> msgs;
-        while (!log_queue.empty()) {
-            msgs.push_back(log_queue.front());
-            log_queue.pop();
-        }
-        cv.notify_all(); 
-        lock.unlock();
-        {
-            std::lock_guard<std::mutex> log_lock(log_mutex);
-            flush_buffer(msgs);
-        }
-        lock.lock();
-        
-    }
-}
 
-void start_logger_thread() {
-    is_running = true;
-    logger_thread = std::thread(logger_thread_func);
-}
-
-void stop_logger_thread() {
-    is_running = false;
-    cv.notify_all();
-    if (logger_thread.joinable()) {
-        logger_thread.join();
-    }
-}
-
-void signal_log(const std::string& message) {
-    std::unique_lock<std::mutex> lock(queue_mutex);  
-    log_queue.push(message);
-    if (log_queue.size() >= max_size_log_queue) {
-      cv.notify_one();
-      cv.wait(lock, [] { return log_queue.empty(); });
-    }
-}
 
 
 
@@ -1460,7 +1428,8 @@ static int write_log(const char *message, size_t len, int take_lock)
     if (logfile)
     {
       std::string log_message(message, len);
-      signal_log(log_message);
+      log_queue.push(log_message);
+      flush_buffer();
     }
   }
   else if (output_type == OUTPUT_SYSLOG)
@@ -2716,7 +2685,6 @@ static int server_audit_init(void *p __attribute__((unused)))
   if (logging) {
     start_logging();
   }
-  start_logger_thread();
 
   init_done= 1;
   return 0;
@@ -2734,23 +2702,19 @@ static int server_audit_init_mysql(void *p)
 
 static int server_audit_deinit(void *p __attribute__((unused)))
 {
-
   resize_flush(0);
-
   if (!init_done)
     return 0;
 
   init_done = 0;
   coll_free(&incl_user_coll);
   coll_free(&excl_user_coll);
-  stop_logger_thread();
 
   if (output_type == OUTPUT_FILE && logfile) {
     logger_close(logfile);
     logfile=NULL;
   } else if (output_type == OUTPUT_SYSLOG)
     closelog();
-  is_running = false;
 
   mysql_prlock_destroy(&lock_operations);
   flogger_mutex_destroy(&lock_atomic);
@@ -2919,6 +2883,7 @@ static void update_file_rotations(MYSQL_THD thd  __attribute__((unused)),
   logfile->rotations= rotations;
   mysql_prlock_unlock(&lock_operations);
 }
+
 
 
 static void update_log_buffer_size(MYSQL_THD thd  __attribute__((unused)),
