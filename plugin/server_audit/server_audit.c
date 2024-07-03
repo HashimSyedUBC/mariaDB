@@ -309,6 +309,7 @@ static unsigned int mode, mode_readonly= 0;
 static ulong output_type;
 static ulong syslog_facility, syslog_priority;
 std::queue<std::string> log_queue;
+std::mutex queue_lock;
 size_t max_size_log_queue= 0;
 
 
@@ -1142,49 +1143,76 @@ static int start_logging()
 }
 
 
-void flush_vector(const std::vector<std::string>& all_messages) {
+void flush_vector(const std::vector<std::string>& all_messages, int take_lock) {
+    fprintf(stderr, "\n THIS IS NAIVE WITH LOCKS AND BUFFER NOT HUNG\n\n\n\n");
+
+    if (take_lock)
+    {
+        mysql_prlock_wrlock(&lock_operations);
+    }
+
     std::string concatenated_messages = "";
-    if (logfile == NULL) return;
     // Use the initial size when starting a new batch of pushes
     my_off_t filesize = logger_space_left(logfile); // High I/O called once every batch
     my_off_t initial_filesize = file_rotate_size;
 
-    for (int i = 0; i < all_messages.size(); i++) {
-        if (concatenated_messages.size() > filesize) {
-            fprintf(stderr, "\n\n\n writing this conc insde for loop no lockk%s", concatenated_messages.c_str());
-            if (!(is_active = (logger_write_r(logfile, 1, concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length()))) {
-                ++log_write_failures;
-            }
-            concatenated_messages = "";
-            filesize = initial_filesize; // Start with initial file size each time you reach 0
-        }
-        std::string msg = all_messages[i];
-        concatenated_messages = concatenated_messages + msg;
-        filesize -= msg.size(); // Decrement the filesize to keep track of if rotation is needed
-    }
-    if (concatenated_messages != "") {
-      fprintf(stderr, "\n\n\n writing this conc OUTSIDE this isfor loop no lockk%s", concatenated_messages.c_str());
 
-      if (!(is_active = (logger_write_r(logfile, 1, concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length()))) {
-        ++log_write_failures;
+    for (int i = 0; i < all_messages.size(); i++) {
+        std::string msg = all_messages[i];
+        concatenated_messages += msg;
+        filesize -= msg.size(); // Decrement the filesize to keep track of if rotation is needed
+
+        if (concatenated_messages.size() > filesize) {
+          
+
+          if (!(is_active = (logger_write_r(logfile, 1, concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length()))) {
+              ++log_write_failures;
+          }
+
+          
+          concatenated_messages = "";
+          filesize = initial_filesize; // Start with initial file size each time you reach 0
       }
     }
+
+   
+
+
+
+    if (!concatenated_messages.empty()) {
+        if (!(is_active = (logger_write_r(logfile, 1, concatenated_messages.c_str(), concatenated_messages.length()) == (int)concatenated_messages.length()))) {
+            ++log_write_failures;
+        }
+    }
+
+     if (take_lock)
+    {
+        mysql_prlock_unlock(&lock_operations);
+    }
+
 }
 
-void flush_buffer() {
+void flush_buffer(int take_lock, std::unique_lock<std::mutex>& lock) {
     std::vector<std::string> msgs;
-    if (log_queue.size() < max_size_log_queue) return;
+    if (log_queue.size() < log_buffer_size) {
+      lock.unlock();
+      return;
+    } 
+
     while (!log_queue.empty()) {
         msgs.push_back(log_queue.front());
         log_queue.pop();
     }
-    flush_vector(msgs);
+    lock.unlock();
+    flush_vector(msgs, take_lock);
 }
+
 
 static void resize_flush(size_t new_size) 
 {
+  std::unique_lock<std::mutex> lock(queue_lock);
   max_size_log_queue= new_size;
-  flush_buffer();
+  flush_buffer(1, lock);
 }
 
 
@@ -1194,7 +1222,6 @@ static int stop_logging()
   last_error_buf[0]= 0;
   if (output_type == OUTPUT_FILE && logfile)
   {
-    flush_buffer();
     logger_close(logfile);
     logfile= NULL;
   }
@@ -1427,9 +1454,11 @@ static int write_log(const char *message, size_t len, int take_lock)
   {
     if (logfile)
     {
+
       std::string log_message(message, len);
+      std::unique_lock<std::mutex> lock(queue_lock);
       log_queue.push(log_message);
-      flush_buffer();
+      flush_buffer(take_lock, lock);
     }
   }
   else if (output_type == OUTPUT_SYSLOG)
@@ -1449,6 +1478,57 @@ static int write_log(const char *message, size_t len, int take_lock)
   }
   return result;
 }
+
+// static int write_log(const char *message, size_t len, int take_lock)
+// {
+//   int result= 0;
+//   if (take_lock)
+//   {
+//     /* Start by taking a read lock */
+//     mysql_prlock_rdlock(&lock_operations);
+//   }
+
+//   if (output_type == OUTPUT_FILE)
+//   {
+//     if (logfile)
+//     {
+//       std::string log_message(message, len);
+//       {
+//         log_queue.push(log_message);
+//         std::unique_lock<std::mutex> lock(queue_lock);
+//         if (log_queue.size() >= log_buffer_size) {
+//         while (log_queue.size() > log_buffer_size) {
+//           std::string msg = log_queue.front();
+//           my_bool allow_rotate= !take_lock; /* Allow rotate if caller write lock */
+//           if (take_lock && logger_time_to_rotate(logfile))
+//           {
+//             /* We have to rotate the log, change above read lock to write lock */
+//             mysql_prlock_unlock(&lock_operations);
+//             mysql_prlock_wrlock(&lock_operations);
+//             allow_rotate= 1;
+//           }
+//           if (!(is_active= (logger_write_r(logfile, allow_rotate, msg.c_str(), len) ==
+//                             (int) len)))
+//           {
+//             ++log_write_failures;
+//             result= 1;
+//           }
+//         }
+//       }
+//     }
+    
+//     }
+//   }
+//   else if (output_type == OUTPUT_SYSLOG)
+//   {
+//     syslog(syslog_facility_codes[syslog_facility] |
+//            syslog_priority_codes[syslog_priority],
+//            "%s %.*s", syslog_info, (int) len, message);
+//   }
+//   if (take_lock)
+//     mysql_prlock_unlock(&lock_operations);
+//   return result;
+// }
 
 
 
