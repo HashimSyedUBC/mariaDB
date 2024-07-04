@@ -316,6 +316,7 @@ std::mutex queue_mutex;
 std::condition_variable cv;
 std::atomic<bool> is_running(true);
 std::thread logger_thread;
+const std::chrono::milliseconds flush_buffer_interval(1000);
 
 
 static ulonglong events; /* mask for events to log */
@@ -1402,22 +1403,21 @@ void logger_thread_func() {
         cv.wait(lock, [] {
             return !log_queue.empty() || !is_running.load();
         });
-        std::vector<std::string> msgs;
-        while (!log_queue.empty()) {
-            msgs.push_back(log_queue.front());
-            log_queue.pop();
-        }
-        cv.notify_all(); 
+        std::queue<std::string> local_queue;
+        std::swap(local_queue, log_queue);
         lock.unlock();
+        cv.notify_all(); 
+        std::vector<std::string> msgs;
+        while (!local_queue.empty()) {
+            msgs.push_back(local_queue.front());
+            local_queue.pop();
+        }
         {
             std::lock_guard<std::mutex> log_lock(log_mutex);
             flush_buffer(msgs);
         }
-        lock.lock();
-        
     }
 }
-
 void start_logger_thread() {
     is_running = true;
     logger_thread = std::thread(logger_thread_func);
