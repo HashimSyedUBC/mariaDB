@@ -29,7 +29,6 @@
 #include <pthread.h>
 #include <vector>
 #include <string>
-#include <sync_queue.h>
 #include <assert.h>
 
 #ifndef _WIN32
@@ -316,7 +315,6 @@ std::mutex queue_mutex;
 std::condition_variable cv;
 std::atomic<bool> is_running(true);
 std::thread logger_thread;
-const std::chrono::milliseconds flush_buffer_interval(1000);
 
 
 static ulonglong events; /* mask for events to log */
@@ -329,7 +327,6 @@ static char incl_user_buffer[1024];
 static char excl_user_buffer[1024];
 static unsigned int query_log_limit= 0;
 static unsigned long long log_buffer_size= 0;
-SyncQueue<std::string> message_queue(1);
 
 static char servhost[HOSTNAME_LENGTH+1];
 static uint servhost_len;
@@ -1184,7 +1181,6 @@ static int stop_logging()
   last_error_buf[0]= 0;
   if (output_type == OUTPUT_FILE && logfile)
   {
-    cv.notify_one();
     resize_flush(log_buffer_size);
     logger_close(logfile);
     logfile= NULL;
@@ -1398,24 +1394,26 @@ static void change_connection(struct connection_info *cn,
 }
 
 void logger_thread_func() {
+    std::unique_lock<std::mutex> lock(queue_mutex);
+
     while (is_running || !log_queue.empty()) {
-        std::unique_lock<std::mutex> lock(queue_mutex);
         cv.wait(lock, [] {
-            return !log_queue.empty() || !is_running.load();
+            return (!log_queue.empty() || !is_running.load());
         });
-        std::queue<std::string> local_queue;
-        std::swap(local_queue, log_queue);
-        lock.unlock();
-        cv.notify_all(); 
         std::vector<std::string> msgs;
-        while (!local_queue.empty()) {
-            msgs.push_back(local_queue.front());
-            local_queue.pop();
+        while (!log_queue.empty()) {
+            msgs.push_back(log_queue.front());
+            log_queue.pop();
         }
+        cv.notify_all(); 
+
+        lock.unlock();
+
         {
             std::lock_guard<std::mutex> log_lock(log_mutex);
             flush_buffer(msgs);
         }
+        lock.lock();
     }
 }
 void start_logger_thread() {
@@ -1436,13 +1434,8 @@ void signal_log(const std::string& message) {
     log_queue.push(message);
     if (log_queue.size() >= max_size_log_queue) {
       cv.notify_one();
-      cv.wait(lock, [] { return log_queue.empty(); });
     }
 }
-
-
-
-
 
 /*
   Write to the log
@@ -2736,7 +2729,7 @@ static int server_audit_deinit(void *p __attribute__((unused)))
 {
 
   resize_flush(0);
-
+  fprintf(stderr, "\n\n\n resize flush at deinit finished \n\n\n");
   if (!init_done)
     return 0;
 
@@ -2744,6 +2737,7 @@ static int server_audit_deinit(void *p __attribute__((unused)))
   coll_free(&incl_user_coll);
   coll_free(&excl_user_coll);
   stop_logger_thread();
+  fprintf(stderr, "\n\n logger thread stopped \n\n");
 
   if (output_type == OUTPUT_FILE && logfile) {
     logger_close(logfile);
