@@ -327,6 +327,7 @@ static char incl_user_buffer[1024];
 static char excl_user_buffer[1024];
 static unsigned int query_log_limit= 0;
 static unsigned long long log_buffer_size= 0;
+static unsigned long long log_buffer_time= 100;
 
 static char servhost[HOSTNAME_LENGTH+1];
 static uint servhost_len;
@@ -390,6 +391,8 @@ static void rotate_log(MYSQL_THD thd, struct st_mysql_sys_var *var,
                        void *var_ptr, const void *save);
 static void update_log_buffer_size(MYSQL_THD thd, struct st_mysql_sys_var *var,
                                     void *var_ptr, const void *save);
+static void update_log_buffer_time(MYSQL_THD thd, struct st_mysql_sys_var *var,
+void *var_ptr, const void *save);
 
 static MYSQL_SYSVAR_STR(incl_users, incl_users, PLUGIN_VAR_RQCMDARG,
        "Comma separated list of users to monitor",
@@ -471,6 +474,9 @@ static MYSQL_SYSVAR_UINT(query_log_limit, query_log_limit,
 static MYSQL_SYSVAR_ULONGLONG(log_buffer_size, log_buffer_size,
        PLUGIN_VAR_RQCMDARG, "Size of the log buffer (1 or 20 to 1000)",
        NULL, update_log_buffer_size, 1, 1, 100 * 1024 * 1024, 1);
+static MYSQL_SYSVAR_ULONGLONG(log_buffer_time, log_buffer_time,
+      PLUGIN_VAR_RQCMDARG, "Size of the log buffer (1 or 20 to 1000)",
+      NULL, update_log_buffer_time, 1, 1, 100 * 1024 * 1024, 1);
 
 char locinfo_ini_value[sizeof(struct connection_info)+4];
 
@@ -554,6 +560,7 @@ static struct st_mysql_sys_var* vars[] = {
     MYSQL_SYSVAR(file_rotate_size),
     MYSQL_SYSVAR(file_rotations),
     MYSQL_SYSVAR(log_buffer_size),
+    MYSQL_SYSVAR(log_buffer_time),
     MYSQL_SYSVAR(file_rotate_now),
     MYSQL_SYSVAR(logging),
     MYSQL_SYSVAR(mode),
@@ -1397,7 +1404,7 @@ void logger_thread_func() {
     std::unique_lock<std::mutex> lock(queue_mutex);
 
     while (is_running || !log_queue.empty()) {
-        cv.wait(lock, [] {
+        cv.wait_for(lock, std::chrono::milliseconds(log_buffer_size), [] {
             return (!log_queue.empty() || !is_running.load());
         });
         std::vector<std::string> msgs;
@@ -1405,13 +1412,13 @@ void logger_thread_func() {
             msgs.push_back(log_queue.front());
             log_queue.pop();
         }
-        cv.notify_all(); 
-
+        cv.notify_all();
         lock.unlock();
-
-        {
-            std::lock_guard<std::mutex> log_lock(log_mutex);
-            flush_buffer(msgs);
+        if (!msgs.empty()) {
+            {
+                std::lock_guard<std::mutex> log_lock(log_mutex);
+                flush_buffer(msgs);
+            }
         }
         lock.lock();
     }
@@ -2931,6 +2938,24 @@ static void update_log_buffer_size(MYSQL_THD thd  __attribute__((unused)),
   mysql_prlock_wrlock(&lock_operations);
 
   logfile->buffer_size = log_buffer_size;
+
+  mysql_prlock_unlock(&lock_operations);
+}
+
+static void update_log_buffer_time(MYSQL_THD thd  __attribute__((unused)),
+              struct st_mysql_sys_var *var  __attribute__((unused)),
+              void *var_ptr  __attribute__((unused)), const void *save)
+{
+  log_buffer_time = *(unsigned long long *) save;
+  error_header();
+  fprintf(stderr, "Log buffer time was changed to '%lld'.\n", 
+  log_buffer_time);
+  if (!logging || output_type != OUTPUT_FILE) 
+    return;
+
+  mysql_prlock_wrlock(&lock_operations);
+
+  logfile->buffer_time = log_buffer_time;
 
   mysql_prlock_unlock(&lock_operations);
 }
