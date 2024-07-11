@@ -15,4 +15,8 @@
 
 SET(SOURCES server_audit.c test_audit_v4.c plugin_audit_v4.h)
 
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
+set_source_files_properties(server_audit.c PROPERTIES LANGUAGE CXX)
+
 MYSQL_ADD_PLUGIN(server_audit ${SOURCES} MODULE_ONLY RECOMPILE_FOR_EMBEDDED)
