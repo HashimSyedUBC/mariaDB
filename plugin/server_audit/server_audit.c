@@ -327,7 +327,7 @@ static char incl_user_buffer[1024];
 static char excl_user_buffer[1024];
 static unsigned int query_log_limit= 0;
 static unsigned long long log_buffer_size= 0;
-static unsigned long long log_buffer_time= 100;
+static unsigned long long log_buffer_time= 1000;
 
 static char servhost[HOSTNAME_LENGTH+1];
 static uint servhost_len;
@@ -473,10 +473,10 @@ static MYSQL_SYSVAR_UINT(query_log_limit, query_log_limit,
        NULL, NULL, 1024, 0, 0x7FFFFFFF, 1);
 static MYSQL_SYSVAR_ULONGLONG(log_buffer_size, log_buffer_size,
        PLUGIN_VAR_RQCMDARG, "Size of the log buffer (1 or 20 to 1000)",
-       NULL, update_log_buffer_size, 1, 1, 100 * 1024 * 1024, 1);
+       NULL, update_log_buffer_size, 1, 1, 9999, 1);
 static MYSQL_SYSVAR_ULONGLONG(log_buffer_time, log_buffer_time,
-      PLUGIN_VAR_RQCMDARG, "Size of the log buffer (1 or 20 to 1000)",
-      NULL, update_log_buffer_time, 1, 1, 100 * 1024 * 1024, 1);
+      PLUGIN_VAR_RQCMDARG, "Time of log buffer ms (500 or 1000000)",
+      NULL, update_log_buffer_time, 1000, 500, 3600000, 1);
 
 char locinfo_ini_value[sizeof(struct connection_info)+4];
 
@@ -1404,7 +1404,7 @@ void logger_thread_func() {
     std::unique_lock<std::mutex> lock(queue_mutex);
 
     while (is_running || !log_queue.empty()) {
-        cv.wait_for(lock, std::chrono::milliseconds(log_buffer_size), [] {
+        cv.wait_for(lock, std::chrono::milliseconds(log_buffer_time), [] {
             return (!log_queue.empty() || !is_running.load());
         });
         std::vector<std::string> msgs;
@@ -1412,15 +1412,13 @@ void logger_thread_func() {
             msgs.push_back(log_queue.front());
             log_queue.pop();
         }
-        cv.notify_all();
-        lock.unlock();
         if (!msgs.empty()) {
             {
                 std::lock_guard<std::mutex> log_lock(log_mutex);
                 flush_buffer(msgs);
             }
         }
-        lock.lock();
+        cv.notify_all();
     }
 }
 void start_logger_thread() {
